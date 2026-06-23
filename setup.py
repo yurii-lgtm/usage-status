@@ -6,7 +6,7 @@ APP = ["usage-status.py"]
 DATA_FILES = []
 OPTIONS = {
     "argv_emulation": False,
-    "iconfile": None,
+    "iconfile": "assets/UsageStatus.icns",
     "plist": {
         "CFBundleName": "Usage Status",
         "CFBundleDisplayName": "Usage Status",

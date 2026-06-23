@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/repo-icon-512.png" alt="Usage Status" width="128" height="128">
+</p>
+
 # Usage Status
 
 A simple macOS menu bar app that shows how much **SuperGrok**, **Codex**, and **Claude** quota you have left.
@@ -7,6 +11,8 @@ No terminal needed after install — just icons in your menu bar with percentage
 ![macOS 13+](https://img.shields.io/badge/macOS-13%2B-blue)
 ![License MIT](https://img.shields.io/badge/license-MIT-green)
 
+If this saves you from surprise quota burn, **[star the repo](https://github.com/yurii-lgtm/usage-status)** — it helps others find it.
+
 ## Install (easy)
 
 1. Download **[Usage-Status.dmg](https://github.com/yurii-lgtm/usage-status/releases/latest)** from Releases
@@ -14,7 +20,7 @@ No terminal needed after install — just icons in your menu bar with percentage
 3. Double-click **`Install Usage Status.command`**
 4. Usage icons appear in your menu bar
 
-**First launch:** macOS may block the app because it is not notarized. Right-click **Usage Status** in Applications → **Open** → **Open** once.
+**First launch:** If macOS says the app is from an unidentified developer, right-click **Usage Status** in Applications → **Open** → **Open** once. Notarized builds (when available) skip this step.
 
 ## What you see
 
@@ -64,6 +70,22 @@ Run tests:
 ```bash
 python3 -m unittest discover -v
 ```
+
+### Sign & notarize (maintainers)
+
+Public releases open without the right-click workaround when signed with a **Developer ID Application** certificate and notarized:
+
+```bash
+./package.sh
+NOTARIZE=1 \
+  APPLE_ID=you@email.com \
+  APPLE_APP_PASSWORD=app-specific-password \
+  ./package.sh
+```
+
+Or run `./scripts/notarize.sh` after `./package.sh`. Without a Developer ID cert, the script signs nothing and prints instructions.
+
+Upload `docs/social-preview.png` in **GitHub → Settings → General → Social preview** for a nicer link card.
 
 ## Privacy
 

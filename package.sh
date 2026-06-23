@@ -7,6 +7,14 @@ cd "$ROOT"
 
 PYTHON="${PYTHON:-python3}"
 
+if [[ -n "${PYTHONPATH:-}" || -n "${PYTHONHOME:-}" ]]; then
+  echo "warning: clearing PYTHONPATH/PYTHONHOME for a clean build environment" >&2
+  unset PYTHONPATH PYTHONHOME
+fi
+
+echo "==> Building icons"
+env -u PYTHONPATH -u PYTHONHOME "$PYTHON" scripts/build_icon.py
+
 echo "==> Installing build dependencies"
 "$PYTHON" -m pip install --quiet --upgrade pip setuptools wheel py2app pyobjc-framework-Cocoa
 
@@ -65,6 +73,11 @@ hdiutil create \
   -ov \
   -format UDZO \
   "$DMG_PATH" >/dev/null
+
+if [[ "${NOTARIZE:-0}" == "1" ]]; then
+  echo "==> Sign / notarize (when Developer ID credentials are available)"
+  ./scripts/notarize.sh
+fi
 
 echo "==> Done"
 echo "App: $APP_PATH"
