@@ -1,0 +1,32 @@
+# Build artifacts
+build/
+dist/
+__pycache__/
+*.pyc
+*.pyo
+*.py[cod]
+.Python
+
+# Logs and local runtime
+*.log
+
+# macOS
+.DS_Store
+
+# Dev environment
+.venv/
+venv/
+
+# Legacy dev wrapper (superseded by py2app dist output)
+Usage Status.app/
+
+# Separate agent-status tool (not part of this repo)
+agent_logic.py
+agent_status.py
+test_agent_logic.py
+test_agent_status.py
+
+# Scratch / test assets
+assets/*-test*.png
+assets/grok-draw-test.png
+assets/grok-rgb-draw-test.png
