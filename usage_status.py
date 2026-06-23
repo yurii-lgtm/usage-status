@@ -19,6 +19,7 @@ from usage_logic import (
     discover_usage,
     format_reset_clock,
     format_reset_time,
+    format_token_usage_lines,
     format_usage_detail,
     format_usage_list,
     format_usage_menu_title,
@@ -623,6 +624,20 @@ def _add_provider_menu_items(
             )
             limit_item.setEnabled_(False)
             menu.addItem_(limit_item)
+
+        if entry.token_stats is not None:
+            menu.addItem_(ns_menu_item.separatorItem())
+            tokens_header = ns_menu_item.alloc().initWithTitle_action_keyEquivalent_(
+                "    Tokens Used", None, ""
+            )
+            tokens_header.setEnabled_(False)
+            menu.addItem_(tokens_header)
+            for line in format_token_usage_lines(entry.token_stats):
+                token_item = ns_menu_item.alloc().initWithTitle_action_keyEquivalent_(
+                    f"    {line}", None, ""
+                )
+                token_item.setEnabled_(False)
+                menu.addItem_(token_item)
     else:
         if entry.status == UsageStatus.LOGIN_REQUIRED and handler is not None:
             from Foundation import NSString

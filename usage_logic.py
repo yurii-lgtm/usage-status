@@ -45,6 +45,14 @@ class UsageLimit:
     reset_at: Optional[datetime] = None
 
 
+@dataclass(frozen=True)
+class TokenUsageStats:
+    today: Optional[int] = None
+    month: Optional[int] = None
+    lifetime: Optional[int] = None
+    note: str = ""
+
+
 @dataclass
 class UsageInfo:
     provider: Provider
@@ -54,6 +62,7 @@ class UsageInfo:
     reset_at: Optional[datetime] = None
     message: str = ""
     limits: list[UsageLimit] = field(default_factory=list)
+    token_stats: Optional[TokenUsageStats] = None
 
     @property
     def status_color(self) -> str:
@@ -287,6 +296,165 @@ def format_reset_clock(value: Optional[datetime]) -> str:
         return ""
     local = value.astimezone()
     return local.strftime("%b %-d, %-I:%M %p")
+
+
+def format_token_count(value: Optional[int]) -> str:
+    if value is None:
+        return "—"
+    amount = int(value)
+    if amount >= 1_000_000_000:
+        return f"{amount / 1_000_000_000:.1f}B"
+    if amount >= 1_000_000:
+        return f"{amount / 1_000_000:.1f}M"
+    if amount >= 1_000:
+        return f"{amount / 1_000:.1f}K"
+    return str(amount)
+
+
+def _numeric_val(value: object) -> int:
+    if isinstance(value, Mapping):
+        value = value.get("val")
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _message_token_total(usage: object) -> int:
+    if not isinstance(usage, Mapping):
+        return 0
+    total = 0
+    for key in (
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    ):
+        total += _numeric_val(usage.get(key))
+    return total
+
+
+def parse_grok_token_stats(payload: Mapping[str, object]) -> Optional[TokenUsageStats]:
+    config = payload.get("config")
+    if not isinstance(config, Mapping):
+        return None
+
+    month_used = _numeric_val(config.get("used"))
+    lifetime = month_used
+    history = config.get("history")
+    if isinstance(history, list):
+        for entry in history:
+            if isinstance(entry, Mapping):
+                lifetime += _numeric_val(entry.get("totalUsed"))
+
+    return TokenUsageStats(
+        month=month_used,
+        lifetime=lifetime,
+        note="Today not reported by Grok",
+    )
+
+
+def parse_codex_token_stats(
+    payload: Mapping[str, object],
+    *,
+    now: Optional[datetime] = None,
+) -> Optional[TokenUsageStats]:
+    summary = payload.get("summary")
+    lifetime: Optional[int] = None
+    if isinstance(summary, Mapping):
+        try:
+            lifetime = int(summary.get("lifetimeTokens") or 0)
+        except (TypeError, ValueError):
+            lifetime = None
+
+    current = now or datetime.now().astimezone()
+    today_key = current.strftime("%Y-%m-%d")
+    month_prefix = today_key[:7]
+    today = 0
+    month = 0
+    buckets = payload.get("dailyUsageBuckets")
+    if isinstance(buckets, list):
+        for bucket in buckets:
+            if not isinstance(bucket, Mapping):
+                continue
+            date = str(bucket.get("startDate") or "")
+            try:
+                tokens = int(bucket.get("tokens") or 0)
+            except (TypeError, ValueError):
+                continue
+            if date == today_key:
+                today = tokens
+            if date.startswith(month_prefix):
+                month += tokens
+
+    return TokenUsageStats(today=today, month=month, lifetime=lifetime)
+
+
+def aggregate_claude_code_token_stats(
+    *,
+    projects_root: str | Path | None = None,
+    now: Optional[datetime] = None,
+) -> Optional[TokenUsageStats]:
+    root = Path(projects_root) if projects_root is not None else Path.home() / ".claude/projects"
+    if not root.is_dir():
+        return None
+
+    current = now or datetime.now().astimezone()
+    today_key = current.date().isoformat()
+    month_prefix = today_key[:7]
+    today = 0
+    month = 0
+    lifetime = 0
+    found = False
+
+    for path in root.glob("**/*.jsonl"):
+        try:
+            lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("type") != "assistant":
+                continue
+            message = record.get("message")
+            if not isinstance(message, Mapping):
+                continue
+            total = _message_token_total(message.get("usage"))
+            if total <= 0:
+                continue
+            found = True
+            lifetime += total
+            timestamp = str(record.get("timestamp") or "")
+            if timestamp.startswith(month_prefix):
+                month += total
+            if timestamp.startswith(today_key):
+                today += total
+
+    if not found:
+        return None
+
+    return TokenUsageStats(
+        today=today,
+        month=month,
+        lifetime=lifetime,
+        note="Claude Code sessions on this Mac",
+    )
+
+
+def format_token_usage_lines(stats: TokenUsageStats) -> list[str]:
+    lines = [
+        f"Today: {format_token_count(stats.today)} tokens",
+        f"This month: {format_token_count(stats.month)} tokens",
+        f"Lifetime: {format_token_count(stats.lifetime)} tokens",
+    ]
+    if stats.note:
+        lines.append(stats.note)
+    return lines
 
 
 def read_json_file(path: str | Path) -> object:
@@ -636,7 +804,18 @@ def fetch_grok_usage(
             status=UsageStatus.LOGIN_REQUIRED,
             message="Grok login required",
         )
-    return parse_grok_billing(payload)
+    info = parse_grok_billing(payload)
+    try:
+        tokens_payload = http_get_json(
+            f"{url}&format=tokens" if "?" in url else f"{url}?format=tokens",
+            headers=headers,
+            opener=opener,
+        )
+        if isinstance(tokens_payload, Mapping):
+            info.token_stats = parse_grok_token_stats(tokens_payload)
+    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, ValueError):
+        pass
+    return info
 
 
 def load_claude_code_access_token() -> Optional[str]:
@@ -825,7 +1004,10 @@ def fetch_claude_usage(
             status=UsageStatus.ERROR,
             message="Unexpected Claude usage payload",
         )
-    return parse_claude_usage(payload)
+    info = parse_claude_usage(payload)
+    if info.status == UsageStatus.OK:
+        info.token_stats = aggregate_claude_code_token_stats()
+    return info
 
 
 def load_codex_auth_mode(
@@ -846,12 +1028,12 @@ def load_codex_auth_mode(
     return None
 
 
-def _codex_app_server_exchange(
-    method: str,
+def _codex_app_server_exchange_methods(
+    methods: Iterable[str],
     *,
     codex_binary: str,
     timeout: float = 8.0,
-) -> object:
+) -> dict[str, Mapping[str, object]]:
     proc = subprocess.Popen(
         [codex_binary, "app-server"],
         stdin=subprocess.PIPE,
@@ -901,15 +1083,32 @@ def _codex_app_server_exchange(
     read_response(1)
     send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
 
+    responses: dict[str, Mapping[str, object]] = {}
     request_id = 2
-    send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": {}})
-    response = read_response(request_id)
+    for method in methods:
+        send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": {}})
+        responses[method] = read_response(request_id) or {}
+        request_id += 1
+
     proc.terminate()
     try:
         proc.wait(timeout=2)
     except subprocess.TimeoutExpired:
         proc.kill()
-    return response or {}
+    return responses
+
+
+def _codex_app_server_exchange(
+    method: str,
+    *,
+    codex_binary: str,
+    timeout: float = 8.0,
+) -> object:
+    return _codex_app_server_exchange_methods(
+        [method],
+        codex_binary=codex_binary,
+        timeout=timeout,
+    ).get(method, {})
 
 
 def fetch_codex_usage(
@@ -934,16 +1133,30 @@ def fetch_codex_usage(
             message="Codex app not found",
         )
 
-    exchange = app_server or (lambda method: _codex_app_server_exchange(method, codex_binary=binary))
-    try:
-        response = exchange("account/rateLimits/read")
-    except OSError as exc:
-        return UsageInfo(
-            provider=Provider.CODEX,
-            status=UsageStatus.ERROR,
-            message=f"Codex app-server failed: {exc}",
-        )
+    if app_server is not None:
+        try:
+            response = app_server("account/rateLimits/read")
+        except OSError as exc:
+            return UsageInfo(
+                provider=Provider.CODEX,
+                status=UsageStatus.ERROR,
+                message=f"Codex app-server failed: {exc}",
+            )
+        responses = {"account/rateLimits/read": response}
+    else:
+        try:
+            responses = _codex_app_server_exchange_methods(
+                ["account/rateLimits/read", "account/usage/read"],
+                codex_binary=binary,
+            )
+        except OSError as exc:
+            return UsageInfo(
+                provider=Provider.CODEX,
+                status=UsageStatus.ERROR,
+                message=f"Codex app-server failed: {exc}",
+            )
 
+    response = responses.get("account/rateLimits/read")
     if not isinstance(response, Mapping):
         return UsageInfo(
             provider=Provider.CODEX,
@@ -968,8 +1181,16 @@ def fetch_codex_usage(
 
     result = response.get("result")
     if isinstance(result, Mapping):
-        return parse_codex_rate_limits(result)
-    return parse_codex_rate_limits(response)
+        info = parse_codex_rate_limits(result)
+    else:
+        info = parse_codex_rate_limits(response)
+
+    usage_response = responses.get("account/usage/read")
+    if isinstance(usage_response, Mapping) and not usage_response.get("error"):
+        usage_result = usage_response.get("result")
+        if isinstance(usage_result, Mapping):
+            info.token_stats = parse_codex_token_stats(usage_result)
+    return info
 
 
 def discover_usage(
@@ -1036,4 +1257,6 @@ def format_usage_detail(info: UsageInfo) -> str:
             f"{limit.name}: {limit.remaining_percent:.0f}% left "
             f"({format_reset_time(limit.reset_at)})"
         )
+    if info.token_stats is not None:
+        lines.extend(format_token_usage_lines(info.token_stats))
     return "\n".join(lines)

@@ -11,22 +11,126 @@ from unittest import mock
 
 from usage_logic import (
     Provider,
+    TokenUsageStats,
     UsageInfo,
     UsageStatus,
+    aggregate_claude_code_token_stats,
     discover_usage,
     fetch_claude_usage,
     fetch_codex_usage,
     fetch_grok_usage,
     format_reset_time,
+    format_token_count,
+    format_token_usage_lines,
     format_usage_list,
     format_usage_menu_title,
     launch_provider_login,
     load_grok_bearer_token,
     parse_claude_usage,
     parse_codex_rate_limits,
+    parse_codex_token_stats,
     parse_grok_billing,
+    parse_grok_token_stats,
     provider_login_command,
 )
+
+
+class TokenStatsTests(unittest.TestCase):
+    def test_format_token_count(self):
+        self.assertEqual(format_token_count(None), "—")
+        self.assertEqual(format_token_count(472), "472")
+        self.assertEqual(format_token_count(9_175_798), "9.2M")
+        self.assertEqual(format_token_count(9_480_550_558), "9.5B")
+
+    def test_parse_grok_token_stats(self):
+        payload = {
+            "config": {
+                "used": {"val": 475},
+                "history": [
+                    {"totalUsed": {"val": 100}},
+                    {"totalUsed": {"val": 50}},
+                ],
+            }
+        }
+        stats = parse_grok_token_stats(payload)
+        self.assertIsNotNone(stats)
+        assert stats is not None
+        self.assertEqual(stats.month, 475)
+        self.assertEqual(stats.lifetime, 625)
+        self.assertIsNone(stats.today)
+        self.assertIn("Today", stats.note)
+
+    def test_parse_codex_token_stats(self):
+        payload = {
+            "summary": {"lifetimeTokens": 9_480_550_558},
+            "dailyUsageBuckets": [
+                {"startDate": "2026-06-22", "tokens": 179_133_469},
+                {"startDate": "2026-06-23", "tokens": 9_175_798},
+                {"startDate": "2026-05-30", "tokens": 1_000},
+            ],
+        }
+        now = datetime(2026, 6, 23, 12, 0, tzinfo=timezone.utc)
+        stats = parse_codex_token_stats(payload, now=now)
+        self.assertIsNotNone(stats)
+        assert stats is not None
+        self.assertEqual(stats.today, 9_175_798)
+        self.assertEqual(stats.month, 179_133_469 + 9_175_798)
+        self.assertEqual(stats.lifetime, 9_480_550_558)
+
+    def test_aggregate_claude_code_token_stats(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            session = root / "proj" / "session.jsonl"
+            session.parent.mkdir(parents=True)
+            session.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "timestamp": "2026-06-23T10:00:00.000Z",
+                                "message": {
+                                    "usage": {
+                                        "input_tokens": 100,
+                                        "output_tokens": 25,
+                                        "cache_read_input_tokens": 10,
+                                    }
+                                },
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "assistant",
+                                "timestamp": "2026-06-01T12:00:00.000Z",
+                                "message": {
+                                    "usage": {
+                                        "input_tokens": 50,
+                                        "output_tokens": 5,
+                                    }
+                                },
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            now = datetime(2026, 6, 23, 12, 0, tzinfo=timezone.utc)
+            stats = aggregate_claude_code_token_stats(projects_root=root, now=now)
+        self.assertIsNotNone(stats)
+        assert stats is not None
+        self.assertEqual(stats.today, 135)
+        self.assertEqual(stats.month, 135 + 55)
+        self.assertEqual(stats.lifetime, 190)
+
+    def test_format_token_usage_lines(self):
+        lines = format_token_usage_lines(
+            TokenUsageStats(today=1000, month=5000, lifetime=9000, note="test note")
+        )
+        self.assertEqual(lines[0], "Today: 1.0K tokens")
+        self.assertEqual(lines[-1], "test note")
 
 
 class GrokParsingTests(unittest.TestCase):
@@ -111,15 +215,23 @@ class FetcherTests(unittest.TestCase):
         self.assertEqual(info.status, UsageStatus.LOGIN_REQUIRED)
 
     def test_fetch_grok_usage_parses_live_payload(self):
-        payload = {
+        credits_payload = {
             "config": {
                 "creditUsagePercent": 10.0,
                 "billingPeriodEnd": "2026-07-01T00:00:00+00:00",
                 "productUsage": [],
             }
         }
+        tokens_payload = {
+            "config": {
+                "used": {"val": 120},
+                "history": [{"totalUsed": {"val": 30}}],
+            }
+        }
 
         def fake_opener(request, timeout=10.0):
+            url = request.full_url
+            payload = tokens_payload if "format=tokens" in url else credits_payload
             body = json.dumps(payload).encode("utf-8")
 
             class Response:
@@ -141,6 +253,10 @@ class FetcherTests(unittest.TestCase):
             info = fetch_grok_usage(opener=fake_opener)
         self.assertEqual(info.status, UsageStatus.OK)
         self.assertAlmostEqual(info.remaining_percent, 90.0)
+        self.assertIsNotNone(info.token_stats)
+        assert info.token_stats is not None
+        self.assertEqual(info.token_stats.month, 120)
+        self.assertEqual(info.token_stats.lifetime, 150)
 
     def test_fetch_codex_usage_api_key_mode(self):
         info = fetch_codex_usage(
