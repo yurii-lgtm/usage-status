@@ -13,9 +13,13 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+import time
 from typing import Callable, Iterable, Mapping, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+CLAUDE_USAGE_CACHE_TTL_SECONDS = 300.0
+CLAUDE_USAGE_STALE_MAX_SECONDS = 1800.0
 
 
 class Provider(str, Enum):
@@ -87,6 +91,14 @@ class UsageInfo:
         if self.used_percent is not None:
             return f"{self.used_percent:.0f}% used"
         return "Unknown"
+
+
+_claude_usage_cache: Optional[tuple[float, UsageInfo]] = None
+
+
+def clear_claude_usage_cache() -> None:
+    global _claude_usage_cache
+    _claude_usage_cache = None
 
 
 def default_grok_auth_path(home: Path | None = None) -> Path:
@@ -218,7 +230,28 @@ def _launch_terminal_script(shell_command: str) -> bool:
         stderr=subprocess.DEVNULL,
         check=False,
     )
-    return result.returncode == 0
+    if result.returncode == 0:
+        return True
+
+    # Fallback when Automation permission blocks AppleScript control of Terminal.
+    tmp_path = Path.home() / ".usage-status-login.command"
+    try:
+        tmp_path.write_text(
+            "#!/bin/bash\n"
+            "set -euo pipefail\n"
+            f"{shell_command}\n",
+            encoding="utf-8",
+        )
+        tmp_path.chmod(0o755)
+    except OSError:
+        return False
+    open_result = subprocess.run(
+        ["open", "-a", "Terminal", str(tmp_path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return open_result.returncode == 0
 
 
 def launch_provider_login(
@@ -546,6 +579,33 @@ def parse_grok_billing(payload: Mapping[str, object]) -> UsageInfo:
     )
 
 
+def _append_claude_limit(
+    limits: list[UsageLimit],
+    *,
+    label: str,
+    entry: Mapping[str, object],
+) -> None:
+    try:
+        used_percent = float(entry.get("used_percentage"))
+    except (TypeError, ValueError):
+        utilization = entry.get("utilization")
+        try:
+            used_percent = float(utilization) * 100.0
+        except (TypeError, ValueError):
+            try:
+                used_percent = float(entry.get("percent"))
+            except (TypeError, ValueError):
+                return
+    limits.append(
+        UsageLimit(
+            name=label,
+            used_percent=_round_percent(used_percent) or 0.0,
+            remaining_percent=_round_percent(max(0.0, 100.0 - used_percent)) or 0.0,
+            reset_at=parse_epoch_seconds(entry.get("resets_at")),
+        )
+    )
+
+
 def parse_claude_usage(payload: Mapping[str, object]) -> UsageInfo:
     rate_limits = payload.get("rate_limits")
     if not isinstance(rate_limits, Mapping):
@@ -565,24 +625,26 @@ def parse_claude_usage(payload: Mapping[str, object]) -> UsageInfo:
         ("seven_day_sonnet", "7-day Sonnet"),
     ):
         entry = rate_limits.get(key)
-        if not isinstance(entry, Mapping):
-            continue
-        try:
-            used_percent = float(entry.get("used_percentage"))
-        except (TypeError, ValueError):
-            utilization = entry.get("utilization")
-            try:
-                used_percent = float(utilization) * 100.0
-            except (TypeError, ValueError):
+        if isinstance(entry, Mapping):
+            _append_claude_limit(limits, label=label, entry=entry)
+
+    limits_array = rate_limits.get("limits")
+    if isinstance(limits_array, list):
+        label_map = {
+            "session": "5-hour",
+            "weekly_all": "7-day",
+            "weekly": "7-day",
+        }
+        existing = {limit.name for limit in limits}
+        for entry in limits_array:
+            if not isinstance(entry, Mapping):
                 continue
-        limits.append(
-            UsageLimit(
-                name=label,
-                used_percent=_round_percent(used_percent) or 0.0,
-                remaining_percent=_round_percent(max(0.0, 100.0 - used_percent)) or 0.0,
-                reset_at=parse_epoch_seconds(entry.get("resets_at")),
-            )
-        )
+            kind = str(entry.get("kind") or entry.get("group") or "Limit")
+            label = label_map.get(kind, kind)
+            if label in existing:
+                continue
+            _append_claude_limit(limits, label=label, entry=entry)
+            existing.add(label)
 
     if not limits:
         return UsageInfo(
@@ -957,19 +1019,52 @@ def _read_keychain_password(service_name: str) -> str:
     ).strip()
 
 
+def _cached_claude_usage(
+    *,
+    max_age_seconds: float,
+    now: Optional[float] = None,
+) -> Optional[UsageInfo]:
+    if _claude_usage_cache is None:
+        return None
+    cached_at, info = _claude_usage_cache
+    current = now if now is not None else time.monotonic()
+    if current - cached_at > max_age_seconds:
+        return None
+    return info
+
+
+def _store_claude_usage_cache(info: UsageInfo) -> UsageInfo:
+    global _claude_usage_cache
+    if info.status == UsageStatus.OK:
+        _claude_usage_cache = (time.monotonic(), info)
+    return info
+
+
 def fetch_claude_usage(
     *,
     token_loader: Callable[[], Optional[str]] | None = None,
     opener: Callable[..., object] | None = None,
+    force_refresh: bool = False,
+    now: Optional[float] = None,
 ) -> UsageInfo:
     loader = token_loader or load_claude_access_token
     token = loader()
     if not token:
+        clear_claude_usage_cache()
         return UsageInfo(
             provider=Provider.CLAUDE,
             status=UsageStatus.LOGIN_REQUIRED,
             message="Run claude auth login or use Claude Desktop",
         )
+
+    current = now if now is not None else time.monotonic()
+    if not force_refresh:
+        cached = _cached_claude_usage(
+            max_age_seconds=CLAUDE_USAGE_CACHE_TTL_SECONDS,
+            now=current,
+        )
+        if cached is not None:
+            return cached
 
     url = "https://api.anthropic.com/api/oauth/usage"
     headers = {
@@ -981,17 +1076,42 @@ def fetch_claude_usage(
         payload = http_get_json(url, headers=headers, opener=opener)
     except HTTPError as exc:
         if exc.code in {401, 403}:
+            clear_claude_usage_cache()
             return UsageInfo(
                 provider=Provider.CLAUDE,
                 status=UsageStatus.LOGIN_REQUIRED,
                 message="Claude session expired",
             )
+        if exc.code == 429:
+            stale = _cached_claude_usage(
+                max_age_seconds=CLAUDE_USAGE_STALE_MAX_SECONDS,
+                now=current,
+            )
+            if stale is not None:
+                return stale
+            return UsageInfo(
+                provider=Provider.CLAUDE,
+                status=UsageStatus.ERROR,
+                message="Claude rate limited — try Reauthenticate in a few minutes",
+            )
+        stale = _cached_claude_usage(
+            max_age_seconds=CLAUDE_USAGE_STALE_MAX_SECONDS,
+            now=current,
+        )
+        if stale is not None:
+            return stale
         return UsageInfo(
             provider=Provider.CLAUDE,
             status=UsageStatus.ERROR,
             message=f"Claude usage HTTP {exc.code}",
         )
     except (URLError, TimeoutError, json.JSONDecodeError) as exc:
+        stale = _cached_claude_usage(
+            max_age_seconds=CLAUDE_USAGE_STALE_MAX_SECONDS,
+            now=current,
+        )
+        if stale is not None:
+            return stale
         return UsageInfo(
             provider=Provider.CLAUDE,
             status=UsageStatus.ERROR,
@@ -1007,6 +1127,7 @@ def fetch_claude_usage(
     info = parse_claude_usage(payload)
     if info.status == UsageStatus.OK:
         info.token_stats = aggregate_claude_code_token_stats()
+        return _store_claude_usage_cache(info)
     return info
 
 

@@ -376,7 +376,7 @@ def _provider_button_title(entry: UsageInfo) -> str:
 class AuthActionHandler:
     """NSObject bridge so status bar button sign-in actions fire."""
 
-    def __new__(cls):
+    def __new__(cls, app: UsageStatusApp | None = None):
         from Foundation import NSObject
         import objc
 
@@ -391,6 +391,13 @@ class AuthActionHandler:
                     return
                 ok, message = launch_provider_login(provider)
                 if ok:
+                    if provider == Provider.CLAUDE:
+                        from usage_logic import clear_claude_usage_cache
+
+                        clear_claude_usage_cache()
+                    if app is not None:
+                        app.schedule_usage_refresh_after_login(provider)
+                    _notify_login_started(provider)
                     return
                 alert = NSAlert.alloc().init()
                 alert.setMessageText_(f"Sign in to {_provider_title(provider)}")
@@ -571,6 +578,24 @@ def _add_app_menu_items(menu, ns_menu_item, update_handler) -> None:
     )
     check_item.setTarget_(update_handler)
     menu.addItem_(check_item)
+
+
+def _notify_login_started(provider: Provider) -> None:
+    title = _provider_title(provider)
+    subprocess.run(
+        [
+            "osascript",
+            "-e",
+            (
+                f'display notification "Complete sign-in in Terminal. '
+                f'{title} usage will refresh automatically." '
+                f'with title "Usage Status"'
+            ),
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
 
 
 def _add_reauthenticate_menu_item(menu, ns_menu_item, handler, provider: Provider) -> None:
@@ -908,7 +933,7 @@ class UsageStatusApp:
         self.app = NSApplication.sharedApplication()
         _apply_menu_bar_positions(self._enabled_providers)
         status_bar = NSStatusBar.systemStatusBar()
-        self._auth_handler = AuthActionHandler()
+        self._auth_handler = AuthActionHandler(self)
         self._display_handler = DisplayActionHandler(self)
         self._update_handler = UpdateActionHandler()
         items_by_provider: dict[Provider, ProviderBarItem] = {}
@@ -952,6 +977,48 @@ class UsageStatusApp:
         NSRunLoop.currentRunLoop().addTimer_forMode_(self.timer, NSRunLoopCommonModes)
 
     def refreshMenu_(self, _timer) -> None:
+        self.refresh_menu()
+
+    def schedule_usage_refresh_after_login(self, provider: Provider) -> None:
+        for delay in (5.0, 20.0, 45.0):
+            self._schedule_refresh_after_delay(delay, provider.value)
+
+    def _schedule_refresh_after_delay(self, delay: float, provider_value: str) -> None:
+        from Foundation import NSTimer, NSRunLoop, NSRunLoopCommonModes
+
+        timer = NSTimer.timerWithTimeInterval_target_selector_userInfo_repeats_(
+            delay,
+            self,
+            "refreshProviderAfterLogin:",
+            provider_value,
+            False,
+        )
+        NSRunLoop.currentRunLoop().addTimer_forMode_(timer, NSRunLoopCommonModes)
+
+    def refreshProviderAfterLogin_(self, provider_value) -> None:
+        from usage_logic import Provider as UsageProvider, fetch_claude_usage
+
+        try:
+            provider = UsageProvider(str(provider_value))
+        except ValueError:
+            self.refresh_menu()
+            return
+
+        if provider == UsageProvider.CLAUDE:
+            entry = fetch_claude_usage(force_refresh=True)
+            by_provider = {item.provider: item for item in self._entries}
+            by_provider[provider] = entry
+            self._entries = [by_provider[p] for p in PROVIDER_ORDER]
+            item = self._provider_items_by_provider.get(provider)
+            if item is not None and provider in self._enabled_providers:
+                item.update(entry)
+            if self._hud_panel is not None:
+                visible_entries = [
+                    e for e in self._entries if e.provider in self._enabled_providers
+                ]
+                self._hud_panel.update(visible_entries)
+            return
+
         self.refresh_menu()
 
     def is_provider_visible(self, provider: Provider) -> bool:

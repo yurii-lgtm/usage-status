@@ -9,12 +9,15 @@ import unittest
 from datetime import datetime, timezone
 from unittest import mock
 
+from urllib.error import HTTPError
+
 from usage_logic import (
     Provider,
     TokenUsageStats,
     UsageInfo,
     UsageStatus,
     aggregate_claude_code_token_stats,
+    clear_claude_usage_cache,
     discover_usage,
     fetch_claude_usage,
     fetch_codex_usage,
@@ -167,6 +170,18 @@ class GrokParsingTests(unittest.TestCase):
 
 
 class ClaudeParsingTests(unittest.TestCase):
+    def test_parse_claude_usage_reads_limits_array(self):
+        payload = {
+            "limits": [
+                {"kind": "session", "percent": 12, "resets_at": 1_700_000_000},
+                {"kind": "weekly_all", "percent": 34, "resets_at": 1_700_100_000},
+            ]
+        }
+        info = parse_claude_usage(payload)
+        self.assertEqual(info.status, UsageStatus.OK)
+        self.assertEqual(len(info.limits), 2)
+        self.assertAlmostEqual(info.used_percent, 12.0)
+
     def test_parse_claude_usage_prefers_five_hour_window(self):
         payload = {
             "rate_limits": {
@@ -271,6 +286,56 @@ class FetcherTests(unittest.TestCase):
     def test_fetch_claude_usage_without_token(self):
         info = fetch_claude_usage(token_loader=lambda: None, opener=mock.Mock())
         self.assertEqual(info.status, UsageStatus.LOGIN_REQUIRED)
+
+    def test_fetch_claude_usage_uses_cache_and_handles_rate_limit(self):
+        clear_claude_usage_cache()
+        payload = {
+            "five_hour": {"utilization": 0.1, "resets_at": 1_700_000_000},
+            "seven_day": {"utilization": 0.2, "resets_at": 1_700_100_000},
+        }
+
+        def ok_opener(_request, timeout=10.0):
+            body = json.dumps(payload).encode("utf-8")
+
+            class Response:
+                def read(self):
+                    return body
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *_args):
+                    return False
+
+            return Response()
+
+        def rate_limited_opener(_request, timeout=10.0):
+            raise HTTPError("https://api.anthropic.com/api/oauth/usage", 429, "Too Many Requests", None, None)
+
+        info = fetch_claude_usage(
+            token_loader=lambda: "token",
+            opener=ok_opener,
+            now=100.0,
+        )
+        self.assertEqual(info.status, UsageStatus.OK)
+        self.assertAlmostEqual(info.remaining_percent, 90.0)
+
+        cached = fetch_claude_usage(
+            token_loader=lambda: "token",
+            opener=rate_limited_opener,
+            now=150.0,
+        )
+        self.assertEqual(cached.status, UsageStatus.OK)
+        self.assertAlmostEqual(cached.remaining_percent, 90.0)
+
+        clear_claude_usage_cache()
+        stale = fetch_claude_usage(
+            token_loader=lambda: "token",
+            opener=rate_limited_opener,
+            now=100.0,
+        )
+        self.assertEqual(stale.status, UsageStatus.ERROR)
+        self.assertIn("rate limited", stale.message.lower())
 
     def test_discover_usage_calls_all_providers(self):
         entries = discover_usage(
