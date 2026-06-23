@@ -414,9 +414,15 @@ class UpdateActionHandler:
                 import threading
 
                 def work() -> None:
-                    result = check_for_updates()
+                    try:
+                        result = check_for_updates()
+                    except Exception as exc:
+                        result = UpdateCheckResult(
+                            current_version=current_app_version(),
+                            error=f"Update check failed: {exc}",
+                        )
                     self.performSelectorOnMainThread_withObject_waitUntilDone_(
-                        "presentUpdateResult_:",
+                        "presentUpdateResult:",
                         result,
                         False,
                     )

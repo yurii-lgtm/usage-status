@@ -7,7 +7,14 @@ import sys
 import unittest
 from unittest import mock
 
-from usage_status import _acquire_single_instance, _assets_dir, _bundle_resource_root
+from usage_updates import UpdateCheckResult
+
+from usage_status import (
+    UpdateActionHandler,
+    _acquire_single_instance,
+    _assets_dir,
+    _bundle_resource_root,
+)
 
 
 class BundlePathTests(unittest.TestCase):
@@ -46,6 +53,18 @@ class BundlePathTests(unittest.TestCase):
         finally:
             lock_path.unlink(missing_ok=True)
 
+
+class UpdateHandlerTests(unittest.TestCase):
+    def test_present_update_result_selector_is_valid(self):
+        handler = UpdateActionHandler()
+        result = UpdateCheckResult(current_version="1.0.0", latest_version="1.0.0")
+        with mock.patch("usage_status._present_update_alert") as present:
+            handler.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "presentUpdateResult:",
+                result,
+                True,
+            )
+            present.assert_called_once_with(result)
 
 if __name__ == "__main__":
     unittest.main()
