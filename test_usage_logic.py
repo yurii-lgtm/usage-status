@@ -214,10 +214,22 @@ class ProviderLoginTests(unittest.TestCase):
             "usage_logic.provider_login_command",
             return_value=["/usr/bin/grok", "login"],
         ):
-            with mock.patch("usage_logic.subprocess.Popen") as popen:
-                launched = launch_provider_login(Provider.GROK)
-        self.assertTrue(launched)
-        popen.assert_called_once()
+            with mock.patch("usage_logic._launch_terminal_script") as terminal:
+                ok, message = launch_provider_login(Provider.GROK)
+        self.assertTrue(ok)
+        self.assertEqual(message, "")
+        terminal.assert_called_once()
+        launched = terminal.call_args.args[0]
+        self.assertIn("grok", launched)
+        self.assertIn("login", launched)
+
+    def test_launch_provider_login_missing_cli(self):
+        with mock.patch("usage_logic.provider_login_command", return_value=None):
+            with mock.patch("usage_logic._launch_terminal_script") as terminal:
+                ok, message = launch_provider_login(Provider.CLAUDE)
+        self.assertFalse(ok)
+        self.assertIn("Claude Code CLI", message)
+        terminal.assert_called_once()
 
 
 class CliTests(unittest.TestCase):

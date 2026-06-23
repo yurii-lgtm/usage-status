@@ -60,6 +60,13 @@ cat >"$STAGE/Install Usage Status.command" <<'EOF'
 set -euo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 TARGET="/Applications/Usage Status.app"
+
+# Stop duplicate copies (dev LaunchAgent, older installs, test builds).
+launchctl bootout "gui/$(id -u)/com.bot.usage-status" 2>/dev/null || true
+pkill -x "usage-status" 2>/dev/null || true
+pkill -f "usage_status.py" 2>/dev/null || true
+sleep 1
+
 rm -rf "$TARGET"
 ditto "$DIR/Usage Status.app" "$TARGET"
 osascript -e 'display notification "Usage Status is ready in Applications." with title "Usage Status Installed"'

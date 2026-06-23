@@ -40,7 +40,7 @@ Usage Status reads quota from each provider’s CLI session. Sign in once per to
 - **Codex:** `codex login`
 - **Claude:** `claude auth login`
 
-If you are not signed in, the menu bar shows **—** for that provider. Click it or use **Reauthenticate...** to open the login flow.
+If you are not signed in, the menu bar shows **—** for that provider. Open its menu and choose **Sign In...** or **Reauthenticate...** — Terminal opens with the provider login command.
 
 ## Menu options
 
@@ -50,6 +50,7 @@ Each provider menu includes:
 - **Hide [provider]** — remove that icon from the menu bar
 - **Show in Menu Bar** — checkboxes to turn services on/off (available from any visible provider menu)
 - **Reauthenticate...**
+- **Check for Updates...** — compares your build to the latest [GitHub release](https://github.com/yurii-lgtm/usage-status/releases/latest) and opens the DMG download when a newer version is available
 - **Quit Usage Status**
 
 Settings are saved automatically.

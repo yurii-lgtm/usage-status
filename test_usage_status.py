@@ -7,7 +7,7 @@ import sys
 import unittest
 from unittest import mock
 
-from usage_status import _assets_dir, _bundle_resource_root
+from usage_status import _acquire_single_instance, _assets_dir, _bundle_resource_root
 
 
 class BundlePathTests(unittest.TestCase):
@@ -31,6 +31,20 @@ class BundlePathTests(unittest.TestCase):
                     _assets_dir(),
                     "/tmp/Usage Status.app/Contents/Resources/assets",
                 )
+
+
+    def test_single_instance_lock_prevents_second_copy(self):
+        import usage_status
+
+        lock_path = usage_status._instance_lock_path()
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        if lock_path.exists():
+            lock_path.unlink()
+        try:
+            self.assertTrue(_acquire_single_instance())
+            self.assertFalse(_acquire_single_instance())
+        finally:
+            lock_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import fcntl
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 from usage_logic import (
     Provider,
@@ -25,6 +28,7 @@ from usage_preferences import (
     load_display_preferences,
     save_display_preferences,
 )
+from usage_updates import UpdateCheckResult, check_for_updates, current_app_version
 
 REFRESH_INTERVAL_SECONDS = 60.0
 
@@ -377,14 +381,52 @@ class AuthActionHandler:
 
         class _AuthHandler(NSObject):
             def signInProvider_(self, sender) -> None:
+                from AppKit import NSAlert, NSInformationalAlertStyle
+
                 raw = str(sender.representedObject() or "")
                 try:
                     provider = Provider(raw)
                 except ValueError:
                     return
-                launch_provider_login(provider)
+                ok, message = launch_provider_login(provider)
+                if ok:
+                    return
+                alert = NSAlert.alloc().init()
+                alert.setMessageText_(f"Sign in to {_provider_title(provider)}")
+                alert.setInformativeText_(
+                    message or "Could not start sign-in. Try again from the menu."
+                )
+                alert.setAlertStyle_(NSInformationalAlertStyle)
+                alert.runModal()
 
         return _AuthHandler.alloc().init()
+
+
+class UpdateActionHandler:
+    """NSObject bridge for checking GitHub releases."""
+
+    def __new__(cls):
+        from Foundation import NSObject
+        import objc
+
+        class _UpdateHandler(NSObject):
+            def checkForUpdates_(self, _sender) -> None:
+                import threading
+
+                def work() -> None:
+                    result = check_for_updates()
+                    self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                        "presentUpdateResult_:",
+                        result,
+                        False,
+                    )
+
+                threading.Thread(target=work, daemon=True).start()
+
+            def presentUpdateResult_(self, result) -> None:
+                _present_update_alert(result)
+
+        return _UpdateHandler.alloc().init()
 
 
 class DisplayActionHandler:
@@ -470,6 +512,60 @@ def _add_display_settings_menu_items(
     menu.addItem_(show_all)
 
 
+def _present_update_alert(result: UpdateCheckResult) -> None:
+    from AppKit import NSAlert, NSAlertFirstButtonReturn, NSInformationalAlertStyle
+    from Foundation import NSURL
+
+    alert = NSAlert.alloc().init()
+    alert.setAlertStyle_(NSInformationalAlertStyle)
+
+    if result.error:
+        alert.setMessageText_("Could Not Check for Updates")
+        alert.setInformativeText_(result.error)
+        alert.addButtonWithTitle_("OK")
+        alert.runModal()
+        return
+
+    if result.update_available:
+        alert.setMessageText_("Update Available")
+        alert.setInformativeText_(
+            f"A newer version of Usage Status is available.\n\n"
+            f"You have {result.current_version}. "
+            f"Latest is {result.latest_version}.\n\n"
+            f"Download the DMG, open it, and run Install Usage Status.command."
+        )
+        alert.addButtonWithTitle_("Download")
+        alert.addButtonWithTitle_("Later")
+        if alert.runModal() == NSAlertFirstButtonReturn:
+            url = result.download_url or result.release_url
+            if url:
+                from AppKit import NSWorkspace
+
+                NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_(url))
+        return
+
+    alert.setMessageText_("You're Up to Date")
+    alert.setInformativeText_(
+        f"Usage Status {result.current_version} is the latest release."
+    )
+    alert.addButtonWithTitle_("OK")
+    alert.runModal()
+
+
+def _add_app_menu_items(menu, ns_menu_item, update_handler) -> None:
+    version_item = ns_menu_item.alloc().initWithTitle_action_keyEquivalent_(
+        f"    Version {current_app_version()}", None, ""
+    )
+    version_item.setEnabled_(False)
+    menu.addItem_(version_item)
+
+    check_item = ns_menu_item.alloc().initWithTitle_action_keyEquivalent_(
+        "    Check for Updates...", "checkForUpdates:", ""
+    )
+    check_item.setTarget_(update_handler)
+    menu.addItem_(check_item)
+
+
 def _add_reauthenticate_menu_item(menu, ns_menu_item, handler, provider: Provider) -> None:
     from Foundation import NSString
 
@@ -481,7 +577,13 @@ def _add_reauthenticate_menu_item(menu, ns_menu_item, handler, provider: Provide
     menu.addItem_(item)
 
 
-def _add_provider_menu_items(menu, ns_menu_item, entry: UsageInfo) -> None:
+def _add_provider_menu_items(
+    menu,
+    ns_menu_item,
+    entry: UsageInfo,
+    *,
+    handler=None,
+) -> None:
     header = ns_menu_item.alloc().initWithTitle_action_keyEquivalent_(
         _provider_menu_title(entry), None, ""
     )
@@ -516,6 +618,18 @@ def _add_provider_menu_items(menu, ns_menu_item, entry: UsageInfo) -> None:
             limit_item.setEnabled_(False)
             menu.addItem_(limit_item)
     else:
+        if entry.status == UsageStatus.LOGIN_REQUIRED and handler is not None:
+            from Foundation import NSString
+
+            sign_in_item = ns_menu_item.alloc().initWithTitle_action_keyEquivalent_(
+                "    Sign In...", "signInProvider:", ""
+            )
+            sign_in_item.setTarget_(handler)
+            sign_in_item.setRepresentedObject_(
+                NSString.stringWithString_(entry.provider.value)
+            )
+            menu.addItem_(sign_in_item)
+
         message_item = ns_menu_item.alloc().initWithTitle_action_keyEquivalent_(
             f"    {entry.display_label}", None, ""
         )
@@ -531,23 +645,16 @@ def _configure_provider_button_action(
     menu,
     handler,
 ) -> None:
-    from AppKit import NSEventMaskLeftMouseDown
-    from Foundation import NSString
-
-    if entry.status == UsageStatus.LOGIN_REQUIRED:
-        status_item.setMenu_(None)
-        button.setTarget_(handler)
-        button.setAction_("signInProvider:")
-        button.setRepresentedObject_(NSString.stringWithString_(entry.provider.value))
-        button.setToolTip_(f"Click to sign in to {_provider_title(entry.provider)}")
-        button.sendActionOn_(NSEventMaskLeftMouseDown)
-        return
-
     button.setTarget_(None)
     button.setAction_(None)
     button.setRepresentedObject_(None)
     button.sendActionOn_(0)
-    button.setToolTip_(format_usage_menu_title(entry))
+    if entry.status == UsageStatus.LOGIN_REQUIRED:
+        button.setToolTip_(
+            f"{_provider_title(entry.provider)}: open menu and choose Sign In..."
+        )
+    else:
+        button.setToolTip_(format_usage_menu_title(entry))
     status_item.setMenu_(menu)
 
 
@@ -561,11 +668,13 @@ class ProviderBarItem:
         ns_menu_item,
         auth_handler,
         display_handler,
+        update_handler,
         app: UsageStatusApp,
     ) -> None:
         self.provider = provider
         self._auth_handler = auth_handler
         self._display_handler = display_handler
+        self._update_handler = update_handler
         self._app = app
         self.status_item = status_bar.statusItemWithLength_(-1)
         self.status_item.setHighlightMode_(True)
@@ -609,7 +718,12 @@ class ProviderBarItem:
 
     def _rebuild_menu(self, entry: UsageInfo) -> None:
         self.menu.removeAllItems()
-        _add_provider_menu_items(self.menu, self._NSMenuItem, entry)
+        _add_provider_menu_items(
+            self.menu,
+            self._NSMenuItem,
+            entry,
+            handler=self._auth_handler,
+        )
         self.menu.addItem_(self._NSMenuItem.separatorItem())
         _add_hide_provider_menu_item(
             self.menu,
@@ -631,6 +745,8 @@ class ProviderBarItem:
             self._display_handler,
             app=self._app,
         )
+        self.menu.addItem_(self._NSMenuItem.separatorItem())
+        _add_app_menu_items(self.menu, self._NSMenuItem, self._update_handler)
         self.menu.addItem_(self._NSMenuItem.separatorItem())
         quit_item = self._NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
             "Quit Usage Status", "terminate:", "q"
@@ -773,6 +889,7 @@ class UsageStatusApp:
         status_bar = NSStatusBar.systemStatusBar()
         self._auth_handler = AuthActionHandler()
         self._display_handler = DisplayActionHandler(self)
+        self._update_handler = UpdateActionHandler()
         items_by_provider: dict[Provider, ProviderBarItem] = {}
         for provider in MENU_BAR_CREATE_ORDER:
             items_by_provider[provider] = ProviderBarItem(
@@ -782,6 +899,7 @@ class UsageStatusApp:
                 ns_menu_item=NSMenuItem,
                 auth_handler=self._auth_handler,
                 display_handler=self._display_handler,
+                update_handler=self._update_handler,
                 app=self,
             )
         self._provider_items_by_provider = items_by_provider
@@ -877,7 +995,46 @@ class UsageStatusApp:
         self.app.run()
 
 
+def _instance_lock_path() -> Path:
+    return (
+        Path.home()
+        / "Library/Application Support/com.bot.usage-status/instance.lock"
+    )
+
+
+def _acquire_single_instance() -> bool:
+    lock_path = _instance_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("w", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        print(
+            "usage-status: already running (only one copy can show menu bar icons)",
+            file=sys.stderr,
+            flush=True,
+        )
+        return False
+
+    handle.write(str(os.getpid()))
+    handle.flush()
+
+    def _release() -> None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            handle.close()
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    atexit.register(_release)
+    return True
+
+
 def run_menu_bar_app(*, show_hud: bool = True) -> int:
+    if not _acquire_single_instance():
+        return 0
     app = UsageStatusApp(show_hud=show_hud)
     app.run()
     return 0

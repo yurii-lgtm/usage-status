@@ -6,6 +6,7 @@ import json
 import os
 import re
 import select
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass, field
@@ -98,27 +99,79 @@ def default_codex_binary_path() -> str:
     return "/Applications/Codex.app/Contents/Resources/codex"
 
 
+def _login_path() -> str:
+    home = Path.home()
+    parts = [
+        str(home / ".grok/bin"),
+        str(home / ".local/bin"),
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+    ]
+    current = os.environ.get("PATH", "")
+    if current:
+        parts.append(current)
+    return ":".join(parts)
+
+
+def _find_executable(
+    name: str,
+    *,
+    extra_candidates: tuple[str, ...] = (),
+) -> Optional[str]:
+    found = shutil.which(name, path=_login_path())
+    if found:
+        return found
+    for candidate in extra_candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
 def default_grok_binary_path() -> str:
-    candidates = (
-        Path.home() / ".grok/bin/grok",
-        Path("/opt/homebrew/bin/grok"),
-        Path("/usr/local/bin/grok"),
+    found = _find_executable(
+        "grok",
+        extra_candidates=(
+            str(Path.home() / ".grok/bin/grok"),
+            "/opt/homebrew/bin/grok",
+            "/usr/local/bin/grok",
+        ),
     )
-    for path in candidates:
-        if path.is_file():
-            return str(path)
-    found = shutil.which("grok")
-    return found or str(candidates[0])
+    return found or str(Path.home() / ".grok/bin/grok")
 
 
 def default_claude_binary_path() -> str:
-    found = shutil.which("claude")
-    if found:
-        return found
-    for path in ("/opt/homebrew/bin/claude", "/usr/local/bin/claude"):
-        if os.path.isfile(path):
-            return path
-    return "/opt/homebrew/bin/claude"
+    found = _find_executable(
+        "claude",
+        extra_candidates=(
+            str(Path.home() / ".local/bin/claude"),
+            "/opt/homebrew/bin/claude",
+            "/usr/local/bin/claude",
+        ),
+    )
+    return found or "/opt/homebrew/bin/claude"
+
+
+def provider_install_hint(provider: Provider) -> str:
+    if provider == Provider.GROK:
+        return (
+            "Grok CLI not found. Install the Grok app or CLI so "
+            f"{default_grok_binary_path()} exists, then run: grok login"
+        )
+    if provider == Provider.CODEX:
+        return (
+            "Codex not found. Install Codex.app from OpenAI, then run: codex login"
+        )
+    if provider == Provider.CLAUDE:
+        return (
+            "Claude Code CLI not found. Install with:\n"
+            "  npm install -g @anthropic-ai/claude-code\n"
+            "Then run: claude auth login\n"
+            "\n"
+            "Or sign in with the Claude Desktop app (Usage Status reads that session)."
+        )
+    return "Provider CLI not found."
 
 
 def provider_login_command(provider: Provider) -> list[str] | None:
@@ -140,22 +193,42 @@ def provider_login_command(provider: Provider) -> list[str] | None:
     return None
 
 
+def _escape_applescript_string(text: str) -> str:
+    return text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _launch_terminal_script(shell_command: str) -> bool:
+    escaped = _escape_applescript_string(shell_command)
+    script = (
+        'tell application "Terminal" to activate\n'
+        f'tell application "Terminal" to do script "{escaped}"'
+    )
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
 def launch_provider_login(
     provider: Provider,
     *,
-    popen: Callable[..., object] | None = None,
-) -> bool:
+    terminal_launcher: Callable[[str], bool] | None = None,
+) -> tuple[bool, str]:
+    launch = terminal_launcher or _launch_terminal_script
     command = provider_login_command(provider)
     if not command:
-        return False
-    launch = popen or subprocess.Popen
-    launch(
-        command,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-    return True
+        hint = provider_install_hint(provider)
+        launch(f"printf '%s\\n\\n' {shlex.quote(hint)}")
+        return False, hint
+
+    path_prefix = f"export PATH={shlex.quote(_login_path())}; "
+    login_command = path_prefix + " ".join(shlex.quote(part) for part in command)
+    if not launch(login_command):
+        return False, "Could not open Terminal for sign-in."
+    return True, ""
 
 
 def parse_iso_datetime(value: object) -> Optional[datetime]:
