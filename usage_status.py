@@ -81,7 +81,6 @@ MENU_BAR_CREATE_ORDER = (Provider.CLAUDE, Provider.CODEX, Provider.GROK)
 
 MENU_BAR_ICON_SIZE = 18.0
 MENU_ICON_SIZE = 20.0
-HUD_ICON_SIZE = 18.0
 
 ICON_PATHS = {
     Provider.CODEX: (
@@ -113,11 +112,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--probe",
         action="store_true",
         help="Initialize menu bar status items, log readiness, and exit",
-    )
-    parser.add_argument(
-        "--no-hud",
-        action="store_true",
-        help="Hide the floating usage panel (menu bar only)",
     )
     return parser
 
@@ -800,88 +794,6 @@ class ProviderBarItem:
         self.menu.addItem_(quit_item)
 
 
-def _hud_summary_text(entries: list[UsageInfo]) -> str:
-    labels = {
-        Provider.GROK: "Grok",
-        Provider.CODEX: "Codex",
-        Provider.CLAUDE: "Claude",
-    }
-    parts = []
-    for entry in entries:
-        name = labels.get(entry.provider, entry.provider.value)
-        parts.append(f"{name} {_provider_button_suffix(entry)}")
-    return "   ".join(parts)
-
-
-class UsageHudPanel:
-    def __init__(self) -> None:
-        from AppKit import (
-            NSBackingStoreBuffered,
-            NSColor,
-            NSFloatingWindowLevel,
-            NSFont,
-            NSPanel,
-            NSScreen,
-            NSTextField,
-            NSViewMaxXMargin,
-            NSViewWidthSizable,
-            NSWindowCollectionBehaviorCanJoinAllSpaces,
-            NSWindowCollectionBehaviorFullScreenAuxiliary,
-            NSWindowStyleMaskClosable,
-            NSWindowStyleMaskTitled,
-            NSWindowStyleMaskUtilityWindow,
-        )
-
-        visible = NSScreen.mainScreen().visibleFrame()
-        width, height = 380.0, 34.0
-        x = visible.origin.x + visible.size.width - width - 16.0
-        y = visible.origin.y + visible.size.height - height
-        label_x = 10.0
-
-        self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-            ((x, y), (width, height)),
-            NSWindowStyleMaskTitled
-            | NSWindowStyleMaskClosable
-            | NSWindowStyleMaskUtilityWindow,
-            NSBackingStoreBuffered,
-            False,
-        )
-        self.panel.setTitle_("AI Usage")
-        self.panel.setLevel_(NSFloatingWindowLevel + 1)
-        self.panel.setCollectionBehavior_(
-            NSWindowCollectionBehaviorCanJoinAllSpaces
-            | NSWindowCollectionBehaviorFullScreenAuxiliary
-        )
-        self.panel.setHidesOnDeactivate_(False)
-        self.panel.setFloatingPanel_(True)
-        self.panel.setBecomesKeyOnlyIfNeeded_(True)
-        self.panel.setBackgroundColor_(NSColor.windowBackgroundColor())
-
-        self.label = NSTextField.alloc().initWithFrame_(
-            ((label_x, 7), (width - label_x - 10, 18))
-        )
-        self.label.setBezeled_(False)
-        self.label.setDrawsBackground_(False)
-        self.label.setEditable_(False)
-        self.label.setSelectable_(False)
-        self.label.setBordered_(False)
-        self.label.setFont_(NSFont.monospacedSystemFontOfSize_weight_(12, 0.5))
-        self.label.setAutoresizingMask_(NSViewWidthSizable | NSViewMaxXMargin)
-
-        content = self.panel.contentView()
-        if content is not None:
-            content.addSubview_(self.label)
-        self.panel.orderFrontRegardless()
-
-    def update(self, entries: list[UsageInfo]) -> None:
-        self.label.setStringValue_(_hud_summary_text(entries))
-        if not self.panel.isVisible():
-            self.panel.orderFrontRegardless()
-
-    def close(self) -> None:
-        self.panel.orderOut_(None)
-
-
 def _clear_menu_bar_defaults(autosave_names: tuple[str, ...]) -> None:
     for autosave_name in autosave_names:
         for key_prefix in (
@@ -918,7 +830,7 @@ def _apply_menu_bar_positions(enabled_providers: set[Provider]) -> None:
 
 
 class UsageStatusApp:
-    def __init__(self, *, show_hud: bool = True) -> None:
+    def __init__(self) -> None:
         from AppKit import (
             NSApplication,
             NSMenu,
@@ -952,8 +864,6 @@ class UsageStatusApp:
         self._provider_items = [
             items_by_provider[provider] for provider in PROVIDER_ORDER
         ]
-        self._hud_panel = UsageHudPanel() if show_hud else None
-
         self._apply_provider_visibility()
         self.refresh_menu()
 
@@ -961,8 +871,7 @@ class UsageStatusApp:
             1 for provider in PROVIDER_ORDER if provider in self._enabled_providers
         )
         print(
-            f"usage-status: menu bar ready items={visible_count}/{len(PROVIDER_ORDER)} "
-            f"hud={'on' if self._hud_panel is not None else 'off'}",
+            f"usage-status: menu bar ready items={visible_count}/{len(PROVIDER_ORDER)}",
             file=sys.stderr,
             flush=True,
         )
@@ -1012,11 +921,6 @@ class UsageStatusApp:
             item = self._provider_items_by_provider.get(provider)
             if item is not None and provider in self._enabled_providers:
                 item.update(entry)
-            if self._hud_panel is not None:
-                visible_entries = [
-                    e for e in self._entries if e.provider in self._enabled_providers
-                ]
-                self._hud_panel.update(visible_entries)
             return
 
         self.refresh_menu()
@@ -1068,13 +972,6 @@ class UsageStatusApp:
             if provider not in self._enabled_providers:
                 continue
             item.update(by_provider[provider])
-        if self._hud_panel is not None:
-            visible_entries = [
-                entry
-                for entry in self._entries
-                if entry.provider in self._enabled_providers
-            ]
-            self._hud_panel.update(visible_entries)
 
     def run(self) -> None:
         self.app.setActivationPolicy_(1)
@@ -1120,10 +1017,10 @@ def _acquire_single_instance() -> bool:
     return True
 
 
-def run_menu_bar_app(*, show_hud: bool = True) -> int:
+def run_menu_bar_app() -> int:
     if not _acquire_single_instance():
         return 0
-    app = UsageStatusApp(show_hud=show_hud)
+    app = UsageStatusApp()
     app.run()
     return 0
 
@@ -1137,7 +1034,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.probe:
         return run_probe_mode()
 
-    return run_menu_bar_app(show_hud=not args.no_hud)
+    return run_menu_bar_app()
 
 
 if __name__ == "__main__":

@@ -42,7 +42,7 @@ rm -rf "$RELOC"
 ditto "$APP_PATH" "$RELOC"
 "$RELOC/Contents/MacOS/usage-status" --list | tee "$SCRATCH/usage-list-reloc.txt"
 grep -q "provider\tstatus\tcolor" "$SCRATCH/usage-list-reloc.txt"
-open -a "$RELOC" --args --no-hud
+open -a "$RELOC"
 sleep 2
 pgrep -fl "Usage-Status-Test.app" | tee "$SCRATCH/open-launch.txt" || true
 pkill -f "Usage-Status-Test.app" 2>/dev/null || true
