@@ -10,7 +10,7 @@ from typing import Callable, Mapping, Optional
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 GITHUB_REPO = "yurii-lgtm/usage-status"
 RELEASES_LATEST_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 USER_AGENT = f"usage-status/{APP_VERSION}"
