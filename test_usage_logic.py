@@ -202,6 +202,15 @@ class ClaudeParsingTests(unittest.TestCase):
         self.assertAlmostEqual(info.remaining_percent, 58.0)
         self.assertEqual(len(info.limits), 2)
 
+    def test_parse_claude_usage_treats_utilization_as_percent_when_above_one(self):
+        payload = {
+            "five_hour": {"utilization": 2.0, "resets_at": 1_700_000_000},
+            "seven_day": {"utilization": 0.0, "resets_at": 1_700_100_000},
+        }
+        info = parse_claude_usage(payload)
+        self.assertAlmostEqual(info.used_percent, 2.0)
+        self.assertAlmostEqual(info.remaining_percent, 98.0)
+
 
 class CodexParsingTests(unittest.TestCase):
     def test_parse_codex_rate_limits(self):

@@ -590,7 +590,9 @@ def _append_claude_limit(
     except (TypeError, ValueError):
         utilization = entry.get("utilization")
         try:
-            used_percent = float(utilization) * 100.0
+            used_percent = float(utilization)
+            if 0 <= used_percent <= 1:
+                used_percent *= 100.0
         except (TypeError, ValueError):
             try:
                 used_percent = float(entry.get("percent"))
